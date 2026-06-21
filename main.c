@@ -58,6 +58,15 @@ typedef struct {
 } WaveConfig;
 
 typedef struct {
+    int total_damage;
+    int kill_count;
+    int gold_earned;
+    int ticks_in_combat;
+    int total_cost;
+    bool ever_attacked;
+} TowerStats;
+
+typedef struct {
     int hp;
     int gold;
     int wave;
@@ -65,6 +74,7 @@ typedef struct {
     Point path[MAX_PATH];
     int path_len;
     Tower towers[MAX_TOWERS];
+    TowerStats tower_stats[MAX_TOWERS];
     Enemy enemies[MAX_ENEMIES];
 } Game;
 
@@ -615,6 +625,7 @@ static bool add_tower(Game *game, int x, int y) {
         game->towers[i].damage = 3;
         game->towers[i].upgrade_cost = 10;
         game->gold -= cost;
+        game->tower_stats[i].total_cost = cost;
         printf("部署成功：(%d,%d)\n", x, y);
         return true;
     }
@@ -637,7 +648,9 @@ static bool upgrade_tower(Game *game, int x, int y) {
         printf("费用不足，升级需要 %d。\n", tower->upgrade_cost);
         return false;
     }
+    int idx = (int)(tower - game->towers);
     game->gold -= tower->upgrade_cost;
+    game->tower_stats[idx].total_cost += tower->upgrade_cost;
     tower->level += 1;
     tower->range += 1;
     tower->damage += 2;
@@ -682,10 +695,14 @@ static void towers_attack(Game *game) {
         }
 
         if (target == NULL) continue;
+        game->tower_stats[i].ever_attacked = true;
+        game->tower_stats[i].total_damage += tower->damage;
         target->hp -= tower->damage;
         if (target->hp <= 0) {
             target->alive = false;
             game->gold += target->reward;
+            game->tower_stats[i].kill_count += 1;
+            game->tower_stats[i].gold_earned += target->reward;
         }
     }
 }
@@ -825,6 +842,23 @@ static bool prep_phase(Game *game) {
     }
 }
 
+static void update_tower_combat_ticks(Game *game) {
+    for (int i = 0; i < MAX_TOWERS; i++) {
+        Tower *tower = &game->towers[i];
+        if (!tower->active) continue;
+        int range_sq = tower->range * tower->range;
+        for (int j = 0; j < MAX_ENEMIES; j++) {
+            Enemy *enemy = &game->enemies[j];
+            if (!enemy->alive) continue;
+            Point pos = game->path[enemy->path_idx];
+            if (distance_sq(tower->x, tower->y, pos.x, pos.y) <= range_sq) {
+                game->tower_stats[i].ticks_in_combat += 1;
+                break;
+            }
+        }
+    }
+}
+
 static bool run_wave(Game *game, const WaveConfig *cfg) {
     int spawned = 0;
     int tick = 0;
@@ -835,6 +869,7 @@ static bool run_wave(Game *game, const WaveConfig *cfg) {
             }
         }
 
+        update_tower_combat_ticks(game);
         towers_attack(game);
         enemies_move(game);
 
@@ -856,6 +891,65 @@ static bool run_wave(Game *game, const WaveConfig *cfg) {
 
         tick += 1;
         sleep_ms(g_tick_sleep_ms);
+    }
+}
+
+static void render_balance_report(const Game *game) {
+    printf("\n╔══════════════════════════════════════════════════════════════╗\n");
+    printf("║                   数 值 平 衡 报 告                         ║\n");
+    printf("╠══════════════════════════════════════════════════════════════╣\n");
+    printf("║ 干员        │ 输出 │ 击败 │ 阻挡轮次 │ 投入 │ 回报 │ 状态 ║\n");
+    printf("╠═════════════╪══════╪══════╪══════════╪══════╪══════╪══════╣\n");
+
+    int total_damage = 0;
+    int total_kills = 0;
+    int total_cost = 0;
+    int total_gold_earned = 0;
+    bool has_idle = false;
+
+    for (int i = 0; i < MAX_TOWERS; i++) {
+        if (!game->towers[i].active) continue;
+        const Tower *t = &game->towers[i];
+        const TowerStats *s = &game->tower_stats[i];
+        total_damage += s->total_damage;
+        total_kills += s->kill_count;
+        total_cost += s->total_cost;
+        total_gold_earned += s->gold_earned;
+
+        const char *status;
+        if (!s->ever_attacked) {
+            status = "⚠闲置";
+            has_idle = true;
+        } else {
+            status = "  正常";
+        }
+
+        printf("║ (%d,%d) Lv.%d │ %4d │ %4d │ %8d │ %4d │ %4d │%s║\n",
+               t->x, t->y, t->level,
+               s->total_damage, s->kill_count, s->ticks_in_combat,
+               s->total_cost, s->gold_earned, status);
+    }
+
+    printf("╠═════════════╪══════╪══════╪══════════╪══════╪══════╪══════╣\n");
+    printf("║ 合计         │ %4d │ %4d │        - │ %4d │ %4d │      ║\n",
+           total_damage, total_kills, total_cost, total_gold_earned);
+    printf("╚══════════════════════════════════════════════════════════════╝\n");
+
+    if (total_cost > 0) {
+        int roi = total_gold_earned * 100 / total_cost;
+        printf("费用回报率：%d / %d = %d%%\n", total_gold_earned, total_cost, roi);
+    }
+
+    if (has_idle) {
+        printf("\n⚠ 警告：以下干员全程未发起攻击，建议调整位置或地图路径：\n");
+        for (int i = 0; i < MAX_TOWERS; i++) {
+            if (!game->towers[i].active) continue;
+            if (!game->tower_stats[i].ever_attacked) {
+                printf("  → 干员 (%d,%d) Lv.%d 射程 %d，全程无攻击输出\n",
+                       game->towers[i].x, game->towers[i].y,
+                       game->towers[i].level, game->towers[i].range);
+            }
+        }
     }
 }
 
@@ -883,6 +977,7 @@ int main(void) {
             clear_screen();
             render_board(&game, false);
             printf("\n基地失守，游戏失败。\n");
+            render_balance_report(&game);
             return 0;
         }
 
@@ -895,5 +990,6 @@ int main(void) {
     clear_screen();
     render_board(&game, false);
     printf("\n恭喜通关！你成功守住了所有波次。\n");
+    render_balance_report(&game);
     return 0;
 }
